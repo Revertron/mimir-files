@@ -332,6 +332,10 @@ async fn finalize_upload(
     Ok(())
 }
 
+/// Streaming chunk size for download responses (16 KB — matches ygg_stream's
+/// SEND_CHUNK_SIZE so each chunk maps to one stream segment without splitting).
+const DOWNLOAD_CHUNK_SIZE: usize = 256 * 1024;
+
 async fn handle_download(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {
     if !cc.is_authed().await {
         let _ = cc.write_err(req_id, "not authenticated").await;
@@ -347,16 +351,15 @@ async fn handle_download(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id:
         Ok(v) => v,
         Err(_) => { let _ = cc.write_err(req_id, "missing or invalid file hash").await; return; }
     };
-    let offset = match tlv_get_u64(&tlvs, TAG_OFFSET) {
+    let start_offset = match tlv_get_u64(&tlvs, TAG_OFFSET) {
         Ok(v) => v,
         Err(_) => { let _ = cc.write_err(req_id, "missing or invalid offset").await; return; }
     };
     let limit = match tlv_get_u32(&tlvs, TAG_LIMIT) {
-        Ok(v) => v as usize,
-        Err(_) => MAX_CHUNK_SIZE, // default to max chunk size
+        Ok(v) => v as u64,
+        Err(_) => u64::MAX,
     };
 
-    let chunk_size = limit.min(MAX_CHUNK_SIZE);
     let hash_hex = hex::encode(hash_bytes);
     let file_path = file_path_for_hash(&hash_hex);
 
@@ -369,40 +372,55 @@ async fn handle_download(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id:
         }
     };
 
-    if offset >= total_size {
+    if start_offset >= total_size {
         let _ = cc.write_err(req_id, "offset beyond file end").await;
         return;
     }
 
-    // Read chunk from file
+    info!("Starting to push file {:?} of {} bytes", &file_path, total_size);
+
+    // Cap end to limit
+    let end = total_size.min(start_offset.saturating_add(limit));
+
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let mut file = match tokio::fs::File::open(&file_path).await {
         Ok(f) => f,
         Err(_) => { let _ = cc.write_err(req_id, "file not found on disk").await; return; }
     };
 
-    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(start_offset)).await {
         let _ = cc.write_err(req_id, &format!("seek error: {}", e)).await;
         return;
     }
 
-    let bytes_remaining = (total_size - offset) as usize;
-    let read_size = chunk_size.min(bytes_remaining);
-    let mut chunk = vec![0u8; read_size];
-    match file.read_exact(&mut chunk).await {
-        Ok(_) => {}
-        Err(e) => { let _ = cc.write_err(req_id, &format!("read error: {}", e)).await; return; }
+    // Stream chunks: one OK response frame per chunk, all with the same req_id.
+    // Client reads frames in a loop until offset + chunk_len >= total_size.
+    let mut offset = start_offset;
+    while offset < end {
+        let read_size = DOWNLOAD_CHUNK_SIZE.min((end - offset) as usize);
+        let mut chunk = vec![0u8; read_size];
+        match file.read_exact(&mut chunk).await {
+            Ok(_) => {}
+            Err(e) => { let _ = cc.write_err(req_id, &format!("read error: {}", e)).await; return; }
+        }
+
+        let resp = match build_tlv_payload(|w| {
+            tlv_encode_bytes(w, TAG_CHUNK_DATA, &chunk)?;
+            tlv_encode_u64(w, TAG_TOTAL_SIZE, total_size)?;
+            tlv_encode_u64(w, TAG_OFFSET, offset)
+        }) {
+            Ok(r) => r,
+            Err(_) => { let _ = cc.write_err(req_id, "tlv encode error").await; return; }
+        };
+        if cc.write_ok(req_id, &resp).await.is_err() {
+            return; // client disconnected
+        }
+        info!("Pushed chunk from {offset} of file {:?} total {} bytes", &file_path, total_size);
+
+        offset += read_size as u64;
     }
 
-    let resp = match build_tlv_payload(|w| {
-        tlv_encode_bytes(w, TAG_CHUNK_DATA, &chunk)?;
-        tlv_encode_u64(w, TAG_TOTAL_SIZE, total_size)?;
-        tlv_encode_u64(w, TAG_OFFSET, offset)
-    }) {
-        Ok(r) => r,
-        Err(_) => { let _ = cc.write_err(req_id, "tlv encode error").await; return; }
-    };
-    let _ = cc.write_ok(req_id, &resp).await;
+    info!("Finished pushing file {:?} of {} bytes", &file_path, total_size);
 }
 
 async fn handle_file_info(state: &Arc<ServerState>, cc: &Arc<ClientConn>, req_id: u16, p: &[u8]) {

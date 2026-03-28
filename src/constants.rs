@@ -32,7 +32,7 @@ pub const TAG_CHUNK_DATA: u8 = 0x43;
 
 // Limits
 pub const MAX_PAYLOAD: u32 = 2 * 1024 * 1024; // 2 MB max frame
-pub const MAX_CHUNK_SIZE: usize = 1 * 1024 * 1024; // 1 MB max chunk data
+pub const MAX_CHUNK_SIZE: usize = 64 * 1024; // 64 kb max chunk data
 
 // Quotas & retention
 pub const DEFAULT_USER_QUOTA: u64 = 3 * 1024 * 1024 * 1024; // 3 GB
